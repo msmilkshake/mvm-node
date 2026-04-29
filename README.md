@@ -31,11 +31,13 @@ mvm/
 2. **Run Setup**:
    Open a terminal **inside the `bin` folder** and run the following command to configure your User PATH:
    ```powershell
-   .\mvm.ps1 setup
+   mvm setup
    ```
+   *(Alternatively, if you are using PowerShell in that folder: `.\mvm.cmd setup`)*
+   
    *This adds the MVM commands and the active Node path to your environment variables.*
 
-3. **Verify**:
+4. **Verify**:
    Close your terminal and open a new one. Type `mvm` to ensure it is recognized.
 
 ---
