@@ -1,4 +1,4 @@
-﻿# --- No param() block: all arguments are parsed manually from $args below. ---
+# --- No param() block: all arguments are parsed manually from $args below. ---
 # --- This avoids PowerShell's native parameter binder treating tokens like ---
 # --- -v or --version as attempts to bind named parameters (which caused   ---
 # --- "Missing an argument for parameter 'version'" errors previously).    ---
@@ -145,6 +145,198 @@ function Get-NodeBundleInfo {
         }
     }
 
+    return $info
+}
+
+# --- Resolves the project's intended Node version: .mvmrc takes priority over .nvmrc ---
+function Get-ProjectVersion {
+    $mvmrcPath = Find-UpwardFile ".mvmrc"
+    if ($mvmrcPath) {
+        $data = Parse-Mvmrc -Path $mvmrcPath
+        if ($data.Version) { return $data.Version }
+    }
+    return Get-NvmrcVersion
+}
+
+# --- Proxy discovery (runs once per invocation; used by all network calls below) ---
+$script:ProxyUrl = $null
+$mvmrcForProxy = Find-UpwardFile ".mvmrc"
+if ($mvmrcForProxy) {
+    $proxyData = Parse-Mvmrc -Path $mvmrcForProxy
+    if ($proxyData.Proxy) { $script:ProxyUrl = $proxyData.Proxy }
+}
+
+# --- Proxy-aware network helpers ---
+function Invoke-MvmRestMethod {
+    param([string]$Uri, [hashtable]$Headers = $null, [int]$TimeoutSec = 15)
+    $params = @{ Uri = $Uri; UseBasicParsing = $true; TimeoutSec = $TimeoutSec }
+    if ($Headers) { $params.Headers = $Headers }
+    if ($script:ProxyUrl) { $params.Proxy = $script:ProxyUrl }
+    return Invoke-RestMethod @params
+}
+
+function Invoke-MvmWebRequest {
+    param([string]$Uri, [int]$TimeoutSec = 15)
+    $params = @{ Uri = $Uri; UseBasicParsing = $true; TimeoutSec = $TimeoutSec }
+    if ($script:ProxyUrl) { $params.Proxy = $script:ProxyUrl }
+    return Invoke-WebRequest @params
+}
+
+function New-MvmWebClient {
+    $wc = New-Object System.Net.WebClient
+    if ($script:ProxyUrl) { $wc.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl) }
+    return $wc
+}
+
+# --- Resolve an alias (lts/*, lts/<codename>, node, stable) to a concrete version ---
+function Resolve-NodeAlias {
+    param([string]$Alias)
+
+    $fileKey = "win-$($script:NodeArch)-zip"
+    try {
+        $json = Invoke-MvmRestMethod -Uri "https://nodejs.org/dist/index.json"
+    }
+    catch {
+        Write-Host "Error: Could not reach nodejs.org to resolve alias '$Alias': $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+$cacheFile = Join-Path $mvmRoot ".mvm-update-cache.json"
+
+# =========================================================
+# ===================  HELPER FUNCTIONS  ===================
+# =========================================================
+
+# --- Architecture detection (x64 / arm64) ---
+function Get-NodeArch {
+    try {
+        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+        if ($osArch -eq [System.Runtime.InteropServices.Architecture]::Arm64) { return "arm64" }
+        return "x64"
+    }
+    catch {
+        if ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64" -or $env:PROCESSOR_ARCHITECTURE -eq "ARM64") { return "arm64" }
+        return "x64"
+    }
+}
+$script:NodeArch = Get-NodeArch
+
+# --- Generic upward directory search (used for .nvmrc / .mvmrc) ---
+function Find-UpwardFile {
+    param([string]$FileName)
+    $dir = Get-Location
+    while ($true) {
+        $candidate = Join-Path $dir $FileName
+        if (Test-Path $candidate) { return $candidate }
+        $parent = Split-Path $dir -Parent
+        if (-not $parent -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return $null
+}
+
+# --- .nvmrc parsing ---
+function Get-NvmrcVersion {
+    $path = Find-UpwardFile ".nvmrc"
+    if (-not $path) { return $null }
+    $raw = (Get-Content $path -Raw -ErrorAction SilentlyContinue).Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    return $raw
+}
+
+# --- .mvmrc parsing (supports "version=", "proxy=", or a bare version like .nvmrc) ---
+function Parse-Mvmrc {
+    param([string]$Path)
+
+    $result = @{ Version = $null; Proxy = $null }
+    $lines = Get-Content $Path -ErrorAction SilentlyContinue
+    if (-not $lines) { return $result }
+
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) { continue }
+
+        if ($trimmed -match "(?i)^version\s*=\s*(.+)$") {
+            $result.Version = $matches[1].Trim().TrimStart("v")
+        }
+        elseif ($trimmed -match "(?i)^proxy\s*=\s*(.+)$") {
+            $result.Proxy = $matches[1].Trim()
+        }
+        elseif (-not $result.Version) {
+            $result.Version = $trimmed.TrimStart("v")
+        }
+    }
+
+    return $result
+}
+
+# --- Inspect a Node install folder for bundled npm version and corepack status (100% accurate) ---
+function Get-NodeBundleInfo {
+    param(
+        [string]$NodeFolderPath,
+        [switch]$IncludeCorepackVersion  # spawns a process; opt-in for perf-sensitive callers
+    )
+
+    $info = [PSCustomObject]@{
+        NpmVersion      = $null
+        HasCorepack     = $false
+        CorepackVersion = $null
+        CorepackActive  = $false
+    }
+
+    $npmPkgJson = Join-Path $NodeFolderPath "node_modules\npm\package.json"
+    $npmContent = Get-Content $npmPkgJson -Raw -ErrorAction SilentlyContinue
+    if ($npmContent) {
+        try {
+            $info.NpmVersion = ($npmContent | ConvertFrom-Json).version
+        }
+        catch { }
+    }
+
+    $candidates = $json | Where-Object { $_.files -contains $fileKey }
+
+    $match = $null
+    if ($Alias -eq "node" -or $Alias -eq "stable") {
+        $match = $candidates | Select-Object -First 1
+    }
+    elseif ($Alias -eq "lts/*") {
+        $match = $candidates | Where-Object { $_.lts -ne $false } | Select-Object -First 1
+    }
+    elseif ($Alias -match "^lts/(.+)$") {
+        $codename = $matches[1]
+        $match = $candidates | Where-Object { $_.lts -and ($_.lts.ToString().ToLower() -eq $codename.ToLower()) } | Select-Object -First 1
+    }
+    $corepackCmd = Join-Path $NodeFolderPath "corepack.cmd"
+    if (Test-Path $corepackCmd) {
+        $info.HasCorepack = $true
+
+        $shimCandidates = @("yarn.cmd", "pnpm.cmd", "yarnpkg.cmd", "pnpx.cmd")
+        foreach ($shim in $shimCandidates) {
+            $shimContent = Get-Content (Join-Path $NodeFolderPath $shim) -Raw -ErrorAction SilentlyContinue
+            if ($shimContent -and $shimContent -match "corepack") {
+                $info.CorepackActive = $true
+                break
+            }
+        }
+
+        if ($IncludeCorepackVersion) {
+            try {
+                $output = & $corepackCmd --version 2>$null
+                if ($LASTEXITCODE -eq 0 -and $output) {
+                    $info.CorepackVersion = $output.Trim()
+                }
+            }
+            catch { }
+        }
+    }
+    if (-not $match) { return $null }
+    return $match.version.TrimStart("v")
+}
+
+# --- Resolve a partial version (major, or major.minor) to the latest matching release ---
+function Resolve-LatestNodeVersion {
+    param([string]$Partial)
+
+    $fileKey = "win-$($script:NodeArch)-zip"
     return $info
 }
 
@@ -371,6 +563,184 @@ function Get-CleanMvmVersion {
 
 function Test-MvmUpdateAvailable {
     try {
+        $json = Invoke-MvmRestMethod -Uri "https://nodejs.org/dist/index.json"
+        $cached = $null
+        if (Test-Path $cacheFile) {
+            $cached = Get-Content $cacheFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+        }
+
+        $needsRefresh = $true
+        if ($cached -and $cached.lastChecked) {
+            $lastChecked = [datetime]$cached.lastChecked
+            if (((Get-Date) - $lastChecked) -lt (New-TimeSpan -Hours 24)) {
+                $needsRefresh = $false
+            }
+        }
+
+        $latest = if ($cached) { $cached.latestVersion } else { $null }
+
+        if ($needsRefresh) {
+            $tag = Get-LatestMvmTag
+            if ($tag) {
+                $cleanLatest = Get-CleanMvmVersion -RawTag $tag
+                if ($cleanLatest) {
+                    $latest = $cleanLatest
+                    @{ lastChecked = (Get-Date).ToString("o"); latestVersion = $latest } |
+                        ConvertTo-Json | Set-Content $cacheFile -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        if ($latest -and ([version]$latest -gt [version]$MVM_VERSION)) {
+            return $latest
+        }
+        return $null
+    }
+    catch {
+        Write-Host "Error: Could not reach nodejs.org to resolve version '$Partial': $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+        return $null
+    }
+
+    $prefix = "v$Partial."
+    $match = $json |
+        Where-Object { $_.version.StartsWith($prefix) -and $_.files -contains $fileKey } |
+        ForEach-Object {
+            $clean = $_.version.Substring(1)
+            if ([version]::TryParse($clean, [ref]$null)) {
+                [PSCustomObject]@{ Version = $_.version; VerObj = [version]$clean }
+            }
+        } |
+        Sort-Object VerObj -Descending |
+        Select-Object -First 1
+
+    if (-not $match) { return $null }
+    return $match.Version.Substring(1)
+}
+
+# --- Highest *installed* version matching a prefix (major or major.minor), used by 'add' ---
+function Get-HighestInstalledVersion {
+    param([string]$Prefix, [string]$BasePath)
+
+    if (-not (Test-Path $BasePath)) { return $null }
+
+    $searchPrefix = "v$Prefix."
+    Get-ChildItem $BasePath -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "current" -and $_.Name.StartsWith($searchPrefix) } |
+        ForEach-Object {
+            $clean = $_.Name.Substring(1)
+            if ([version]::TryParse($clean, [ref]$null)) {
+                [PSCustomObject]@{ Folder = $_; VerObj = [version]$clean }
+            }
+        } |
+        Sort-Object VerObj -Descending |
+        Select-Object -First 1
+}
+
+# --- Find an installed version by prefix (handles both partial and exact full versions) ---
+function Find-NodeVersion {
+    param([string]$VersionPrefix, [string]$BasePath)
+
+    $prefix = $VersionPrefix.TrimStart("v")
+
+    $exactFolder = Join-Path $BasePath "v$prefix"
+    if (Test-Path $exactFolder) {
+        return [PSCustomObject]@{ Folder = (Get-Item $exactFolder); VerObj = [version]$prefix }
+    }
+
+    $pattern = "v$prefix."
+    Get-ChildItem $BasePath -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne "current" -and $_.Name.StartsWith($pattern) } |
+        ForEach-Object {
+            $clean = $_.Name.Substring(1)
+            if ([version]::TryParse($clean, [ref]$null)) {
+                [PSCustomObject]@{ Folder = $_; VerObj = [version]$clean }
+            }
+        } |
+        Sort-Object VerObj -Descending |
+        Select-Object -First 1
+}
+
+# --- Checksum verification against Node's published SHASUMS256.txt ---
+function Test-NodeChecksum {
+    param([string]$CleanVersion, [string]$ZipPath, [string]$ArchSuffix)
+
+    try {
+        $sumsUrl = "https://nodejs.org/dist/v$CleanVersion/SHASUMS256.txt"
+        $response = Invoke-MvmWebRequest -Uri $sumsUrl
+        $content = $response.Content
+    }
+    catch {
+        Write-Host "Warning: Could not fetch checksum file. Skipping verification." -ForegroundColor Yellow
+        return $true
+    }
+
+    $fileName = "node-v$CleanVersion-win-$ArchSuffix.zip"
+    $line = ($content -split "`r?`n") | Where-Object { $_ -match [regex]::Escape($fileName) } | Select-Object -First 1
+
+    if (-not $line) {
+        Write-Host "Warning: No checksum entry found for $fileName. Skipping verification." -ForegroundColor Yellow
+        return $true
+    }
+
+    $expectedHash = ($line -split "\s+")[0].ToUpper()
+    $actualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpper()
+
+    if ($expectedHash -ne $actualHash) {
+        Write-Host "    Expected: $expectedHash" -ForegroundColor Gray
+        Write-Host "    Actual:   $actualHash" -ForegroundColor Gray
+        return $false
+    }
+    return $true
+}
+
+# --- Resolve the latest release tag via website redirect (no API, no rate limit) ---
+function Get-LatestMvmTag {
+    $url = "https://github.com/$ghOwner/$ghRepo/releases/latest"
+
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($url)
+        $request.Method = "HEAD"
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 5000
+        if ($script:ProxyUrl) { $request.Proxy = New-Object System.Net.WebProxy($script:ProxyUrl) }
+
+        $response = $request.GetResponse()
+        $location = $response.Headers["Location"]
+        $response.Close()
+    }
+    catch [System.Net.WebException] {
+        if ($_.Exception.Response) {
+            $location = $_.Exception.Response.Headers["Location"]
+            $_.Exception.Response.Close()
+        }
+        else {
+            return $null
+        }
+    }
+    catch {
+        return $null
+    }
+
+    if (-not $location) { return $null }
+    if ($location -match "/releases/tag/(.+)$") { return $matches[1] }
+    return $null
+}
+
+# --- Safely strip a leading 'v'/'V' and validate it parses as a real version ---
+function Get-CleanMvmVersion {
+    param([string]$RawTag)
+    if (-not $RawTag) { return $null }
+    $clean = $RawTag -replace "^[vV]", ""
+    $parsed = $null
+    if ([version]::TryParse($clean, [ref]$parsed)) {
+        return $clean
+    }
+    return $null
+}
+
+function Test-MvmUpdateAvailable {
+    try {
         $cached = $null
         if (Test-Path $cacheFile) {
             $cached = Get-Content $cacheFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -406,6 +776,25 @@ function Test-MvmUpdateAvailable {
     catch {
         return $null
     }
+}
+
+# --- Core 'add' logic, extracted into a function so 'use' can auto-install too ---
+function Invoke-AddCommand {
+    param([string]$VersionSpec)
+
+    $rawInput = $VersionSpec.TrimStart("v")
+    $isAlias = $rawInput -match "^(lts/.*|node|stable)$"
+    $isPartial = (-not $isAlias) -and (($rawInput -split "\.").Count -lt 3)
+
+    if ($isAlias -or $isPartial) {
+        Write-Host "Resolving version for '$rawInput'..." -ForegroundColor Cyan
+
+        $resolved = if ($isAlias) { Resolve-NodeAlias -Alias $rawInput } else { Resolve-LatestNodeVersion -Partial $rawInput }
+
+        if (-not $resolved) {
+            Write-Host "No matching Node.js release found for '$rawInput'." -ForegroundColor Red
+            return
+        }
 }
 
 # --- Core 'add' logic, extracted into a function so 'use' can auto-install too ---
@@ -924,6 +1313,285 @@ if ($command -eq "resolve-shell") {
     }
     $target = Find-NodeVersion -VersionPrefix $version -BasePath $base
     if ($target) { Write-Output $target.Folder.FullName }
+    return
+}
+
+# --- Command: Add ---
+if ($command -eq "add") {
+    if (-not $version) { Write-Host "Usage: mvm add VERSION" -ForegroundColor Yellow; return }
+    Invoke-AddCommand -VersionSpec $version
+}
+
+# =========================================================
+# ======================  TOP-LEVEL CHECKS  ================
+# =========================================================
+
+# --- mvm -v / mvm --version : print MVM's own version and exit immediately ---
+if ($ShowVersionFlag -and -not $command) {
+    Write-Host "MVM v$MVM_VERSION"
+    return
+}
+
+# --- Move-Aware Warning ---
+$currentEnvPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($currentEnvPath -notlike "*$binPath*" -and $command -notin @("setup", "install", "help", $null) -and !$Help) {
+    Write-Host "WARNING: MVM is not in your PATH or was moved. Run 'mvm setup' to fix your paths." -ForegroundColor Yellow
+}
+
+# --- Self-update availability warning (skipped only for the 'update' command itself) ---
+if ($command -ne "update") {
+    $updateAvailable = Test-MvmUpdateAvailable
+    if ($updateAvailable) {
+        Write-Host "A new version of MVM is available: v$updateAvailable (current: v$MVM_VERSION). Run 'mvm update' to upgrade." -ForegroundColor Yellow
+    }
+}
+
+# =========================================================
+# =========================  COMMANDS  =====================
+# =========================================================
+
+# --- Help Logic ---
+if ($Help -or $command -eq "help") {
+    Write-Host "`nMini Version Manager (MVM) Help v$MVM_VERSION" -ForegroundColor Cyan
+    Write-Host "-------------------------------"
+    Write-Host "Usage:"
+    Write-Host "  mvm list [-v|--verbose]  - List installed versions"
+    Write-Host "                             (-v/--verbose also shows npm version and exact corepack status)"
+    Write-Host "  mvm add VERSION          - Download and install a version"
+    Write-Host "                             (full: 20.10.0 | partial: 20, 20.10 | alias: lts/*, lts/iron, node, stable)"
+    Write-Host "  mvm use VERSION          - Switch to a version (e.g., 20, 18.20.5, lts/*)"
+    Write-Host "                             Offers to auto-install if the version isn't installed yet"
+    Write-Host "  mvm use                  - Switch using .mvmrc (preferred) or .nvmrc in current/parent directories"
+    Write-Host "  mvm remove VERSION       - Uninstall a version"
+    Write-Host "  mvm current              - Show the active version, its npm version, and corepack status"
+    Write-Host "  mvm which [version]      - Show node.exe path (active version if omitted), npm version, and corepack status"
+    Write-Host "  mvm ls-remote MAJOR      - List available remote releases for a major (e.g. 20) or major.minor (e.g. 20.10)"
+    Write-Host "  mvm setup                - Add/repair MVM in your User PATH"
+    Write-Host "  mvm update               - Self-update MVM to the latest released version"
+    Write-Host "`nOptions:"
+    Write-Host "  -h, --help, help           : Show this help menu"
+    Write-Host "  -v, --version              : Show MVM's own version (when used with no command)"
+    Write-Host "`nNotes:"
+    Write-Host "  - 'use' auto-picks the latest installed minor/patch for a given major version."
+    Write-Host "  - If the requested version isn't installed, 'use' will offer to install it automatically."
+    Write-Host "  - 'add' resolves partial versions and aliases (lts/*, lts/<codename>, node, stable) against nodejs.org."
+    Write-Host "  - Downloads are verified against Node's published SHA256 checksums before extraction."
+    Write-Host "  - ARM64 Windows is auto-detected; the correct Node build (x64/arm64) is installed automatically."
+    Write-Host "  - .mvmrc supports 'version=' and 'proxy=' lines (or a bare version, like .nvmrc)."
+    Write-Host "    If present, .mvmrc's version takes priority over .nvmrc; if .mvmrc has no version, .nvmrc is used."
+    Write-Host "  - .mvmrc and .nvmrc can coexist: e.g. share a team .nvmrc for version, and a personal,"
+    Write-Host "    uncommitted .mvmrc containing only 'proxy=' for corporate network configuration."
+    Write-Host "  - 'current', 'which', and 'list' report each version's bundled npm version and Corepack"
+    Write-Host "    status (bundled/enabled), read directly from the install folder - no network calls."
+    Write-Host "  - MVM checks for its own updates periodically (every 24h, cached) and will warn when"
+    Write-Host "    'mvm update' is available. The check uses GitHub's release redirect, not the rate-limited API."
+    return
+}
+
+# --- Command: Setup ---
+if ($command -eq "setup" -or $command -eq "install") {
+    Write-Host "Configuring MVM environment..." -ForegroundColor Cyan
+
+    $userPath = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+    if (-not $userPath) { $userPath = "" }
+
+    $pathParts = $userPath.Split(";", [StringSplitOptions]::RemoveEmptyEntries)
+    $cleanPath = $pathParts | Where-Object { $_ -notlike "*\mvm\bin" -and $_ -notlike "*\mvm\node\current" }
+    $finalPath = @($binPath, $active) + $cleanPath -join ";"
+
+    try {
+        Set-ItemProperty -Path 'HKCU:\Environment' -Name Path -Value $finalPath -Type ExpandString
+        $env:Path = $finalPath
+
+        if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base | Out-Null }
+
+        Write-Host "Success! Added to PATH:" -ForegroundColor Green
+        Write-Host "  $binPath"
+        Write-Host "  $active"
+        Write-Host "`nYou can now use 'mvm' and 'node' from any window." -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    return
+}
+
+# --- Command: List ---
+if ($command -eq "list") {
+    if (-not (Test-Path $base)) {
+        Write-Host "Node base directory not found."
+        return
+    }
+
+    $currentRealPath = ""
+    if (Test-Path $active) { $currentRealPath = (Get-Item $active).Target }
+
+    $installed = Get-ChildItem $base -Directory | Where-Object { $_.Name -ne "current" }
+
+    if (-not $installed) {
+        Write-Host "No versions installed yet. Run 'mvm add VERSION' to get started." -ForegroundColor Yellow
+        return
+    }
+
+    if ($ListVerboseFlag) {
+        Write-Host "(verbose mode: querying npm and exact corepack versions, this may take a moment)`n" -ForegroundColor Gray
+    }
+
+    foreach ($folder in $installed) {
+        if (-not $ListVerboseFlag) {
+            # Fast path: just the folder name, no filesystem/npm/corepack inspection at all.
+            if ($folder.FullName -eq $currentRealPath) {
+                Write-Host "$($folder.Name) <- Active" -ForegroundColor Green
+            }
+            else {
+                Write-Host $folder.Name
+            }
+            continue
+        }
+
+        # Verbose path: full npm version + corepack status (spawns corepack.cmd per version).
+        $bundle = Get-NodeBundleInfo -NodeFolderPath $folder.FullName -IncludeCorepackVersion
+
+        $npmTag = if ($bundle.NpmVersion) { "npm v$($bundle.NpmVersion)" } else { "npm ?" }
+
+        $corepackTag = if (-not $bundle.HasCorepack) {
+            "corepack: n/a"
+        }
+        elseif ($bundle.CorepackActive) {
+            if ($bundle.CorepackVersion) { "corepack: v$($bundle.CorepackVersion) (enabled)" } else { "corepack: enabled" }
+        }
+        else {
+            if ($bundle.CorepackVersion) { "corepack: v$($bundle.CorepackVersion) (available)" } else { "corepack: available" }
+        }
+
+        $line = "$($folder.Name)  [$npmTag, $corepackTag]"
+
+        if ($folder.FullName -eq $currentRealPath) {
+            Write-Host "$line <- Active" -ForegroundColor Green
+        }
+        else {
+            Write-Host $line
+        }
+    }
+    return
+}
+
+# --- Command: Current ---
+if ($command -eq "current") {
+    if (-not (Test-Path $active)) {
+        Write-Host "No active version set. Run 'mvm use VERSION' first." -ForegroundColor Yellow
+        return
+    }
+    $realPath = (Get-Item $active).Target
+    $versionName = Split-Path $realPath -Leaf
+
+    $bundle = Get-NodeBundleInfo -NodeFolderPath $realPath -IncludeCorepackVersion
+
+    $npmTag = if ($bundle.NpmVersion) { "npm v$($bundle.NpmVersion)" } else { "npm version unknown" }
+
+    $corepackTag = if (-not $bundle.HasCorepack) {
+        "corepack not bundled in this version"
+    }
+    elseif ($bundle.CorepackActive) {
+        "corepack v$($bundle.CorepackVersion) (enabled)"
+    }
+    else {
+        "corepack v$($bundle.CorepackVersion) (available, not enabled - run 'corepack enable')"
+    }
+
+    Write-Host "$versionName" -ForegroundColor Green
+    Write-Host "  $npmTag"
+    Write-Host "  $corepackTag"
+    return
+}
+
+# --- Command: Which ---
+if ($command -eq "which") {
+    $targetFolder = $null
+
+    if (-not $version) {
+        if (-not (Test-Path $active)) {
+            Write-Host "No active version set. Run 'mvm use VERSION' first." -ForegroundColor Yellow
+            return
+        }
+        $realPath = (Get-Item $active).Target
+        $targetFolder = Get-Item $realPath
+    }
+    else {
+        $match = Find-NodeVersion -VersionPrefix $version -BasePath $base
+        if (-not $match) {
+            Write-Host "No installed version matching '$version'." -ForegroundColor Red
+            return
+        }
+        $targetFolder = $match.Folder
+    }
+
+    $nodeExe = Join-Path $targetFolder.FullName "node.exe"
+    if (-not (Test-Path $nodeExe)) {
+        Write-Host "Warning: node.exe not found in $($targetFolder.FullName)" -ForegroundColor Yellow
+    }
+
+    $bundle = Get-NodeBundleInfo -NodeFolderPath $targetFolder.FullName -IncludeCorepackVersion
+
+    $npmTag = if ($bundle.NpmVersion) { "npm v$($bundle.NpmVersion)" } else { "npm version unknown" }
+    $corepackTag = if (-not $bundle.HasCorepack) {
+        "corepack not bundled in this version"
+    }
+    elseif ($bundle.CorepackActive) {
+        "corepack v$($bundle.CorepackVersion) (enabled)"
+    }
+    else {
+        "corepack v$($bundle.CorepackVersion) (available, not enabled)"
+    }
+
+    Write-Host $nodeExe -ForegroundColor Green
+    Write-Host "  $npmTag"
+    Write-Host "  $corepackTag"
+    return
+}
+
+# --- Command: ls-remote ---
+if ($command -eq "ls-remote") {
+    if (-not $version) {
+        Write-Host "Usage: mvm ls-remote MAJOR (e.g. 20) or MAJOR.MINOR (e.g. 20.10)" -ForegroundColor Yellow
+        return
+    }
+
+    $clean = $version.TrimStart("v")
+    if ($clean -notmatch "^\d+(\.\d+)?$") {
+        Write-Host "ls-remote requires at least a major version number (e.g. 'mvm ls-remote 20')." -ForegroundColor Yellow
+        return
+    }
+
+    $fileKey = "win-$($script:NodeArch)-zip"
+    try {
+        $json = Invoke-MvmRestMethod -Uri "https://nodejs.org/dist/index.json"
+    }
+    catch {
+        Write-Host "Error: Could not reach nodejs.org: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    $prefix = "v$clean."
+    $results = $json |
+        Where-Object { $_.version.StartsWith($prefix) -and $_.files -contains $fileKey } |
+        ForEach-Object {
+            $cleanV = $_.version.Substring(1)
+            if ([version]::TryParse($cleanV, [ref]$null)) {
+                [PSCustomObject]@{ Version = $_.version; VerObj = [version]$cleanV; LTS = $_.lts }
+            }
+        } |
+        Sort-Object VerObj -Descending
+
+    if (-not $results) {
+        Write-Host "No remote releases found matching '$clean' for architecture $($script:NodeArch)." -ForegroundColor Yellow
+        return
+    }
+
+    foreach ($r in $results) {
+        $ltsTag = if ($r.LTS -and $r.LTS -ne $false) { " (LTS: $($r.LTS))" } else { "" }
+        Write-Host "$($r.Version)$ltsTag"
+    }
     return
 }
 
