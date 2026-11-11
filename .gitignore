@@ -1,2 +1,5 @@
+.idea
 node/*
 !node/.gitkeep
+mvm.zip
+.mvm-update-cache.json

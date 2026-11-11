@@ -1,2 +1,2 @@
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\mvm\mvm.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\mvm.ps1" %*
